@@ -77,7 +77,7 @@ use libdeflate_sys::{
     libdeflate_zlib_compress, libdeflate_zlib_compress_bound, libdeflate_zlib_decompress,
 };
 use std::fmt::{self, Write};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::ptr::null;
 use std::{convert::TryInto, error::Error};
 
@@ -236,6 +236,7 @@ impl GDeflateDecompressor {
         in_data_raw: &[u8],
         out_data: &mut [u8],
     ) -> DecompressionResult<usize> {
+        let mut bytes_read = 0;
         unsafe {
             init_allocator();
             let mut in_data = Cursor::new(&in_data_raw);
@@ -243,29 +244,24 @@ impl GDeflateDecompressor {
             if !header.is_valid() {
                 return Err(DecompressionError::BadData);
             }
-
-            let tile_offsets = (0..header.num_tiles)
-                .map(|_i| in_data.read_u32::<LittleEndian>().unwrap())
-                .collect::<Vec<u32>>();
-
-            let mut decompressor = GDeflateDecompressor::new();
-
-            let data_base: u32 = header.num_tiles as u32 * 4;
+            let tile_offsets = in_data_raw.as_ptr() as *const u32;
+            let decompressor = GDeflateDecompressor::new();
 
             for tile_index in 0..header.num_tiles {
-                let data_index = if tile_index == 0 {
-                    0
+                let tile_offset = if tile_index > 0 {
+                    *tile_offsets.add(tile_index as usize)
                 } else {
-                    data_base + tile_offsets[tile_index as usize]
+                    0
                 } as usize;
 
                 let data_size = if tile_index < header.num_tiles - 1 {
-                    tile_offsets[tile_index as usize + 1]
+                    *tile_offsets.add(tile_index as usize + 1) - tile_offset as u32
                 } else {
-                    tile_offsets[0]
+                    *tile_offsets
                 };
 
-                let data_ptr = in_data_raw.as_ptr().wrapping_add(data_base as usize)
+                let offset = size_of::<u64>() + tile_offset + header.num_tiles as usize * 4;
+                let data_ptr = in_data_raw.as_ptr().add(offset)
                     as *const std::ffi::c_void;
 
                 let mut compressed_page = libdeflate_gdeflate_in_page {
@@ -276,9 +272,8 @@ impl GDeflateDecompressor {
                 let output_offset = tile_index as usize * KDEFAULT_TILE_SIZE;
 
                 let out_ptr =
-                    out_data.as_mut_ptr().wrapping_add(output_offset) as *mut std::ffi::c_void;
+                    out_data.as_mut_ptr().add(output_offset) as *mut std::ffi::c_void;
                 let mut out_nbytes = 0;
-
                 let decomp_result: libdeflate_result = libdeflate_gdeflate_decompress(
                     decompressor.p,
                     &mut compressed_page,
@@ -288,7 +283,7 @@ impl GDeflateDecompressor {
                     &mut out_nbytes,
                 ) as libdeflate_result;
                 
-                return match decomp_result {
+                let _res = match decomp_result {
                     libdeflate_result_LIBDEFLATE_SUCCESS => Ok(out_nbytes),
                     libdeflate_result_LIBDEFLATE_BAD_DATA => Err(DecompressionError::BadData),
                     libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
@@ -297,10 +292,11 @@ impl GDeflateDecompressor {
                     _ => {
                         panic!("libdeflate_gdeflate_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
                     }
-                }
+                };
+                bytes_read += out_nbytes;
             }
         }
-        Err(DecompressionError::BadData)
+        Ok(bytes_read)
     }
 }
 
