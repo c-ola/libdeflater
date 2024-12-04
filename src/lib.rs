@@ -244,8 +244,10 @@ impl GDeflateDecompressor {
             if !header.is_valid() {
                 return Err(DecompressionError::BadData);
             }
-            let tile_offsets = in_data_raw.as_ptr() as *const u32;
+            let tile_offsets = in_data_raw.as_ptr().add(size_of::<u64>()) as *const u32;
             let decompressor = GDeflateDecompressor::new();
+
+            let base_in_ptr = tile_offsets.add(header.num_tiles as usize) as *const u8;
 
             for tile_index in 0..header.num_tiles {
                 let tile_offset = if tile_index > 0 {
@@ -260,9 +262,7 @@ impl GDeflateDecompressor {
                     *tile_offsets
                 };
 
-                let offset = size_of::<u64>() + tile_offset + header.num_tiles as usize * 4;
-                let data_ptr = in_data_raw.as_ptr().add(offset)
-                    as *const std::ffi::c_void;
+                let data_ptr = base_in_ptr.add(tile_offset) as *const std::ffi::c_void;
 
                 let mut compressed_page = libdeflate_gdeflate_in_page {
                     data: data_ptr,
@@ -284,16 +284,17 @@ impl GDeflateDecompressor {
                 ) as libdeflate_result;
                 
                 let _res = match decomp_result {
-                    libdeflate_result_LIBDEFLATE_SUCCESS => Ok(out_nbytes),
-                    libdeflate_result_LIBDEFLATE_BAD_DATA => Err(DecompressionError::BadData),
+                    libdeflate_result_LIBDEFLATE_SUCCESS => bytes_read += out_nbytes,
+                    libdeflate_result_LIBDEFLATE_BAD_DATA => {
+                        return Err(DecompressionError::BadData)
+                    },
                     libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
-                        Err(DecompressionError::InsufficientSpace)
+                        return Err(DecompressionError::InsufficientSpace)
                     }
                     _ => {
                         panic!("libdeflate_gdeflate_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
                     }
                 };
-                bytes_read += out_nbytes;
             }
         }
         Ok(bytes_read)
