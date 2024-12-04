@@ -4,6 +4,17 @@
 #![allow(dead_code)]
 #![allow(bad_style)]
 
+
+// Gdeflate
+#[repr(C)]
+pub struct libdeflate_gdeflate_decompressor { _unused : [ u8 ; 0 ] , }
+#[repr(C)]
+pub struct libdeflate_gdeflate_compressor { _unused : [ u8 ; 0 ] , }
+#[repr(C)]
+pub struct libdeflate_gdeflate_out_page { pub data: *mut ::std::os::raw::c_void, pub nbytes: usize }
+#[repr(C)]
+pub struct libdeflate_gdeflate_in_page { pub data: *const ::std::os::raw::c_void, pub nbytes: usize }
+
 #[repr(C)]
 pub struct libdeflate_compressor { _unused : [ u8 ; 0 ] , }
 #[repr(C)]
@@ -18,69 +29,95 @@ extern "C" {
     pub fn libdeflate_alloc_decompressor() -> *mut libdeflate_decompressor;
     pub fn libdeflate_free_decompressor(decompressor: *mut libdeflate_decompressor);
 
+    // NVIDIA - LIBDEFLATE
+    pub fn libdeflate_gdeflate_decompress(decomp: *mut libdeflate_gdeflate_decompressor,
+        in_pages: *mut libdeflate_gdeflate_in_page,
+        in_npages: usize,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize,
+        actual_out_nbytes_ret: *mut usize
+    ) -> usize;
+
+    pub fn libdeflate_gdeflate_compress(compressor: *mut libdeflate_gdeflate_compressor,
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize,
+        out_pages: *mut libdeflate_gdeflate_out_page,
+        out_npages: usize,
+    ) -> usize;
+
+    pub fn libdeflate_gdeflate_compress_bound(compressor: *mut libdeflate_gdeflate_compressor,
+        in_nbytes: usize) -> usize;
+    
+    pub fn libdeflate_alloc_gdeflate_compressor(compression_level: ::std::os::raw::c_int) -> *mut libdeflate_gdeflate_compressor;
+    pub fn libdeflate_alloc_gdeflate_decompressor()-> *mut libdeflate_gdeflate_decompressor;
+    
+    pub fn libdeflate_free_gdeflate_compressor (compressor : * mut libdeflate_gdeflate_compressor);
+    pub fn libdeflate_free_gdeflate_decompressor (decomp: * mut libdeflate_gdeflate_compressor);
+
+
+    pub fn libdeflate_zlib_compress_bound(compressor: *mut libdeflate_compressor,
+        in_nbytes: usize) -> usize;
+
     pub fn libdeflate_gzip_decompress(decompressor: *mut libdeflate_decompressor,
-                                      in_: *const ::std::os::raw::c_void,
-                                      in_nbytes: usize ,
-                                      out: *mut ::std::os::raw::c_void,
-                                      out_nbytes_avail: usize,
-                                      actual_out_nbytes_ret: *mut usize) -> libdeflate_result;
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize ,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize,
+        actual_out_nbytes_ret: *mut usize) -> libdeflate_result;
 
     pub fn libdeflate_zlib_decompress(decompressor: *mut libdeflate_decompressor,
-                                      in_: *const ::std::os::raw::c_void,
-                                      in_nbytes: usize,
-                                      out: *mut ::std::os::raw::c_void,
-                                      out_nbytes_avail: usize,
-                                      actual_out_nbytes_ret: *mut usize) -> libdeflate_result;
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize,
+        actual_out_nbytes_ret: *mut usize) -> libdeflate_result;
 
     pub fn libdeflate_deflate_decompress(decompressor: *mut libdeflate_decompressor,
-                                         in_: *const ::std::os::raw::c_void,
-                                         in_nbytes: usize,
-                                         out: *mut ::std::os::raw::c_void,
-                                         out_nbytes_avail: usize,
-                                         actual_out_nbytes_ret: *mut usize) -> libdeflate_result;
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize,
+        actual_out_nbytes_ret: *mut usize) -> libdeflate_result;
 
     pub fn libdeflate_alloc_compressor(compression_level: ::std::os::raw::c_int) -> *mut libdeflate_compressor;
 
     pub fn libdeflate_deflate_compress_bound(compressor: *mut libdeflate_compressor,
-                                             in_nbytes: usize) -> usize;
+        in_nbytes: usize) -> usize;
 
 
     pub fn libdeflate_deflate_compress(compressor: *mut libdeflate_compressor,
-                                       in_: *const ::std::os::raw::c_void,
-                                       in_nbytes: usize,
-                                       out: *mut ::std::os::raw::c_void,
-                                       out_nbytes_avail: usize) -> usize;
-
-    pub fn libdeflate_zlib_compress_bound(compressor: *mut libdeflate_compressor,
-                                          in_nbytes: usize) -> usize;
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize) -> usize;
 
     pub fn libdeflate_zlib_compress(compressor: *mut libdeflate_compressor,
-                                    in_: *const ::std::os::raw::c_void,
-                                    in_nbytes: usize,
-                                    out: *mut ::std::os::raw::c_void,
-                                    out_nbytes_avail: usize) -> usize;
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize) -> usize;
 
     pub fn libdeflate_gzip_compress_bound(compressor: *mut libdeflate_compressor,
-                                          in_nbytes: usize) -> usize;
+        in_nbytes: usize) -> usize;
 
     pub fn libdeflate_gzip_compress(compressor: *mut libdeflate_compressor,
-                                    in_: *const ::std::os::raw::c_void,
-                                    in_nbytes: usize,
-                                    out: *mut ::std::os::raw::c_void,
-                                    out_nbytes_avail: usize ) -> usize;
+        in_: *const ::std::os::raw::c_void,
+        in_nbytes: usize,
+        out: *mut ::std::os::raw::c_void,
+        out_nbytes_avail: usize ) -> usize;
 
     pub fn libdeflate_free_compressor (compressor : * mut libdeflate_compressor);
 
     pub fn libdeflate_crc32(crc32: u32,
-                            buffer: *const ::std::os::raw::c_void,
-                            len: usize) -> u32;
+        buffer: *const ::std::os::raw::c_void,
+        len: usize) -> u32;
 
     pub fn libdeflate_adler32(adler32: u32,
-                              buffer: *const ::std::os::raw::c_void,
-                              len: usize) -> u32;
+        buffer: *const ::std::os::raw::c_void,
+        len: usize) -> u32;
 
     pub fn libdeflate_set_memory_allocator(malloc_func: unsafe extern "C" fn(size: usize) -> *mut ::std::os::raw::c_void,
-                                           free_func: unsafe extern "C" fn(ptr: *mut ::std::os::raw::c_void));
+    free_func: unsafe extern "C" fn(ptr: *mut ::std::os::raw::c_void));
 }
 
 // Basic tests for Rust-to-C bindings. These tests are just for quick
@@ -130,10 +167,10 @@ mod tests {
             let mut out_data: [u8; 1<<16] = [0; 1<<16];
             let compressor = libdeflate_alloc_compressor(MAX_COMP_LVL);
             let sz = libdeflate_deflate_compress(compressor,
-                                                 in_data.as_ptr() as *const core::ffi::c_void,
-                                                 in_data.len(),
-                                                 out_data.as_mut_ptr() as *mut core::ffi::c_void,
-                                                 out_data.len());
+                in_data.as_ptr() as *const core::ffi::c_void,
+                in_data.len(),
+                out_data.as_mut_ptr() as *mut core::ffi::c_void,
+                out_data.len());
             assert_ne!(sz, 0);
             assert!(sz < 100);
         }
@@ -146,8 +183,8 @@ mod tests {
 
         unsafe {
             let ret = libdeflate_crc32(init,
-                                       buf.as_ptr() as *const core::ffi::c_void,
-                                       buf.len());
+                buf.as_ptr() as *const core::ffi::c_void,
+                buf.len());
 
             assert_ne!(ret, init);
         }
@@ -160,8 +197,8 @@ mod tests {
 
         unsafe {
             let ret = libdeflate_adler32(init,
-                                         buf.as_ptr() as *const core::ffi::c_void,
-                                         buf.len());
+                buf.as_ptr() as *const core::ffi::c_void,
+                buf.len());
 
             assert_ne!(ret, init);
         }

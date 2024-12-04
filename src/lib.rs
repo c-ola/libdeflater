@@ -61,29 +61,25 @@
 //! [`zlib_compress_bound`]: struct.Compressor.html#method.zlib_compress_bound
 //! [`gzip_compress_bound`]: struct.Compressor.html#method.gzip_compress_bound
 
-use std::error::Error;
-use std::fmt;
-use libdeflate_sys::{libdeflate_decompressor,
-                            libdeflate_alloc_decompressor,
-                            libdeflate_free_decompressor,
-                            libdeflate_gzip_decompress,
-                            libdeflate_zlib_decompress,
-                            libdeflate_deflate_decompress,
-                            libdeflate_result,
-                            libdeflate_result_LIBDEFLATE_SUCCESS,
-                            libdeflate_result_LIBDEFLATE_BAD_DATA,
-                            libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE,
-                            libdeflate_compressor,
-                            libdeflate_alloc_compressor,
-                            libdeflate_deflate_compress_bound,
-                            libdeflate_deflate_compress,
-                            libdeflate_zlib_compress_bound,
-                            libdeflate_zlib_compress,
-                            libdeflate_gzip_compress_bound,
-                            libdeflate_gzip_compress,
-                            libdeflate_free_compressor,
-                            libdeflate_crc32,
-                            libdeflate_adler32};
+use byteorder::{LittleEndian, ReadBytesExt};
+use libdeflate_sys::{
+    libdeflate_adler32, libdeflate_alloc_compressor, libdeflate_alloc_decompressor,
+    libdeflate_alloc_gdeflate_compressor, libdeflate_alloc_gdeflate_decompressor,
+    libdeflate_compressor, libdeflate_crc32, libdeflate_decompressor, libdeflate_deflate_compress,
+    libdeflate_deflate_compress_bound, libdeflate_deflate_decompress, libdeflate_free_compressor,
+    libdeflate_free_decompressor, libdeflate_free_gdeflate_compressor,
+    libdeflate_free_gdeflate_decompressor, libdeflate_gdeflate_compress,
+    libdeflate_gdeflate_compress_bound, libdeflate_gdeflate_compressor,
+    libdeflate_gdeflate_decompress, libdeflate_gdeflate_decompressor, libdeflate_gdeflate_in_page,
+    libdeflate_gdeflate_out_page, libdeflate_gzip_compress, libdeflate_gzip_compress_bound,
+    libdeflate_gzip_decompress, libdeflate_result, libdeflate_result_LIBDEFLATE_BAD_DATA,
+    libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE, libdeflate_result_LIBDEFLATE_SUCCESS,
+    libdeflate_zlib_compress, libdeflate_zlib_compress_bound, libdeflate_zlib_decompress,
+};
+use std::fmt::{self, Write};
+use std::io::{Cursor, Read};
+use std::ptr::null;
+use std::{convert::TryInto, error::Error};
 
 #[cfg(feature = "use_rust_alloc")]
 mod malloc_wrapper;
@@ -92,6 +88,221 @@ use malloc_wrapper::init_allocator;
 
 #[cfg(not(feature = "use_rust_alloc"))]
 fn init_allocator() {}
+
+const K_GDEFLATE_ID: u8 = 4;
+const KDEFAULT_TILE_SIZE: usize = 64 * 1024;
+const MINIMUM_COMPRESSION_LEVEL: u32 = 1;
+const MAXIMUM_COMPRESSION_LEVEL: u32 = 32;
+
+enum Flags {
+    CompressSingleThread = 0x200,
+}
+pub trait BitField<Bits> {
+    type Output;
+    fn bit_split(self, bits: Bits) -> Self::Output;
+}
+
+macro_rules! smash {
+    ($a:ident) => {
+        usize
+    };
+}
+
+macro_rules! smash2 {
+    ($a:ident, $b:ty) => {
+        $b
+    };
+}
+
+macro_rules! impl_bit {
+    ($base_type:ty, $($a:ident),+) => {
+        impl BitField<($(smash!($a)),*)> for $base_type {
+            type Output = ($(smash2!($a, $base_type)),*);
+            #[allow(unused_assignments)]
+            fn bit_split(mut self, ($($a),*): ($(smash!($a)),*)) -> Self::Output {
+                if 0 $(+$a)* != std::mem::size_of::<$base_type>() * 8 {
+                    panic!();
+                }
+                $(
+                    let t = self & ((1 << $a) - 1);
+                    self >>= $a;
+                    let $a = t;
+                )*
+
+                ($($a),*)
+            }
+        }
+    };
+}
+
+impl_bit!(u8, a, b);
+impl_bit!(u8, a, b, c);
+impl_bit!(u8, a, b, c, d);
+impl_bit!(u8, a, b, c, d, e);
+
+impl_bit!(u16, a, b);
+impl_bit!(u16, a, b, c);
+impl_bit!(u16, a, b, c, d);
+impl_bit!(u16, a, b, c, d, e);
+
+impl_bit!(u32, a, b);
+impl_bit!(u32, a, b, c);
+impl_bit!(u32, a, b, c, d);
+impl_bit!(u32, a, b, c, d, e);
+
+impl_bit!(u64, a, b);
+impl_bit!(u64, a, b, c);
+impl_bit!(u64, a, b, c, d);
+impl_bit!(u64, a, b, c, d, e);
+
+struct TileStream {
+    id: u8,
+    magic: u8,
+    num_tiles: u16,      //u16,
+    tile_size_idx: u32,  //u8,
+    last_tile_size: u32, //u32,
+    reserv1: u32,
+    //bitfield: u32, //tileSizeIdx: 2, lastTileSize: 18, reserv1: 12
+}
+
+impl TileStream {
+    pub fn new(uncompressed_size: usize) -> TileStream {
+        let mut num_tiles = (uncompressed_size / KDEFAULT_TILE_SIZE).try_into().unwrap();
+        let last_tile_size = (uncompressed_size - num_tiles as usize * KDEFAULT_TILE_SIZE)
+            .try_into()
+            .unwrap();
+        num_tiles += if last_tile_size != 0 { 1 } else { 0 };
+        TileStream {
+            id: K_GDEFLATE_ID,
+            magic: K_GDEFLATE_ID ^ 0xff,
+            tile_size_idx: 1,
+            num_tiles,
+            last_tile_size,
+            reserv1: 0,
+        }
+    }
+
+    pub fn from<W: Read + std::io::Seek>(data: &mut W) -> std::io::Result<TileStream> {
+        let id = data.read_u8()?;
+        let magic = data.read_u8()?;
+        let num_tiles = data.read_u16::<LittleEndian>()?;
+        let flags = data.read_u32::<LittleEndian>()?;
+        let (tile_size_idx, last_tile_size, reserv1) = flags.bit_split((2, 18, 12));
+        Ok(TileStream {
+            id,
+            magic,
+            num_tiles,
+            tile_size_idx,
+            last_tile_size,
+            reserv1,
+        })
+    }
+
+    pub fn get_uncompressed_size(&self) -> usize {
+        self.num_tiles as usize * KDEFAULT_TILE_SIZE
+            - if self.last_tile_size == 0 {
+                0
+            } else {
+                KDEFAULT_TILE_SIZE - self.last_tile_size as usize
+            }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.id == self.magic ^ 0xff && self.id == K_GDEFLATE_ID
+    }
+}
+
+pub struct GDeflateDecompressor {
+    p: *mut libdeflate_gdeflate_decompressor,
+}
+unsafe impl Send for GDeflateDecompressor {}
+
+impl GDeflateDecompressor {
+    pub fn new() -> GDeflateDecompressor {
+        unsafe {
+            init_allocator();
+            let ptr = libdeflate_alloc_gdeflate_decompressor();
+            if !ptr.is_null() {
+                GDeflateDecompressor { p: ptr }
+            } else {
+                panic!("libdeflate_alloc_gdeflate_decompressor returned NULL: out of memory")
+            }
+        }
+    }
+}
+
+impl GDeflateDecompressor {
+    pub fn gdeflate_decompress(
+        in_data_raw: &[u8],
+        out_data: &mut [u8],
+    ) -> DecompressionResult<usize> {
+        unsafe {
+            init_allocator();
+            let mut in_data = Cursor::new(&in_data_raw);
+            let header = TileStream::from(&mut in_data).unwrap();
+            if !header.is_valid() {
+                return Err(DecompressionError::BadData);
+            }
+
+            let tile_offsets = (0..header.num_tiles)
+                .map(|_i| in_data.read_u32::<LittleEndian>().unwrap())
+                .collect::<Vec<u32>>();
+
+            let mut decompressor = GDeflateDecompressor::new();
+
+            let data_base: u32 = header.num_tiles as u32 * 4;
+
+            for tile_index in 0..header.num_tiles {
+                let data_index = if tile_index == 0 {
+                    0
+                } else {
+                    data_base + tile_offsets[tile_index as usize]
+                } as usize;
+
+                let data_size = if tile_index < header.num_tiles - 1 {
+                    tile_offsets[tile_index as usize + 1]
+                } else {
+                    tile_offsets[0]
+                };
+
+                let data_ptr = in_data_raw.as_ptr().wrapping_add(data_base as usize)
+                    as *const std::ffi::c_void;
+
+                let mut compressed_page = libdeflate_gdeflate_in_page {
+                    data: data_ptr,
+                    nbytes: data_size as usize,
+                };
+
+                let output_offset = tile_index as usize * KDEFAULT_TILE_SIZE;
+
+                let out_ptr =
+                    out_data.as_mut_ptr().wrapping_add(output_offset) as *mut std::ffi::c_void;
+                let mut out_nbytes = 0;
+
+                let decomp_result: libdeflate_result = libdeflate_gdeflate_decompress(
+                    decompressor.p,
+                    &mut compressed_page,
+                    1,
+                    out_ptr,
+                    KDEFAULT_TILE_SIZE,
+                    &mut out_nbytes,
+                ) as libdeflate_result;
+                
+                return match decomp_result {
+                    libdeflate_result_LIBDEFLATE_SUCCESS => Ok(out_nbytes),
+                    libdeflate_result_LIBDEFLATE_BAD_DATA => Err(DecompressionError::BadData),
+                    libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
+                        Err(DecompressionError::InsufficientSpace)
+                    }
+                    _ => {
+                        panic!("libdeflate_gdeflate_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
+                    }
+                }
+            }
+        }
+        Err(DecompressionError::BadData)
+    }
+}
 
 /// A `libdeflate` decompressor that can inflate DEFLATE, zlib, or
 /// gzip data.
@@ -131,14 +342,13 @@ type DecompressionResult<T> = std::result::Result<T, DecompressionError>;
 
 #[allow(non_upper_case_globals)]
 impl Decompressor {
-
     /// Returns a newly constructed instance of a `Decompressor`.
     pub fn new() -> Decompressor {
         unsafe {
             init_allocator();
             let ptr = libdeflate_alloc_decompressor();
             if !ptr.is_null() {
-                Decompressor{ p: ptr }
+                Decompressor { p: ptr }
             } else {
                 panic!("libdeflate_alloc_decompressor returned NULL: out of memory");
             }
@@ -151,31 +361,30 @@ impl Decompressor {
     /// decompressed bytes written into `out`, or an error (see
     /// [`DecompressionError`](enum.DecompressionError.html) for error
     /// cases).
-    pub fn gzip_decompress(&mut self,
-                           gz_data: &[u8],
-                           out: &mut [u8]) -> DecompressionResult<usize> {
+    pub fn gzip_decompress(
+        &mut self,
+        gz_data: &[u8],
+        out: &mut [u8],
+    ) -> DecompressionResult<usize> {
         unsafe {
             init_allocator();
             let mut out_nbytes = 0;
             let in_ptr = gz_data.as_ptr() as *const std::ffi::c_void;
             let out_ptr = out.as_mut_ptr() as *mut std::ffi::c_void;
-            let ret: libdeflate_result =
-                libdeflate_gzip_decompress(self.p,
-                                           in_ptr,
-                                           gz_data.len(),
-                                           out_ptr,
-                                           out.len(),
-                                           &mut out_nbytes);
+            let ret: libdeflate_result = libdeflate_gzip_decompress(
+                self.p,
+                in_ptr,
+                gz_data.len(),
+                out_ptr,
+                out.len(),
+                &mut out_nbytes,
+            );
             match ret {
-                libdeflate_result_LIBDEFLATE_SUCCESS => {
-                    Ok(out_nbytes)
-                },
-                libdeflate_result_LIBDEFLATE_BAD_DATA => {
-                    Err(DecompressionError::BadData)
-                },
+                libdeflate_result_LIBDEFLATE_SUCCESS => Ok(out_nbytes),
+                libdeflate_result_LIBDEFLATE_BAD_DATA => Err(DecompressionError::BadData),
                 libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
                     Err(DecompressionError::InsufficientSpace)
-                },
+                }
                 _ => {
                     panic!("libdeflate_gzip_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
                 }
@@ -189,32 +398,31 @@ impl Decompressor {
     /// decompressed bytes written into `out`, or an error (see
     /// [`DecompressionError`](enum.DecompressionError.html) for error
     /// cases).
-    pub fn zlib_decompress(&mut self,
-                           zlib_data: &[u8],
-                           out: &mut [u8]) -> DecompressionResult<usize> {
+    pub fn zlib_decompress(
+        &mut self,
+        zlib_data: &[u8],
+        out: &mut [u8],
+    ) -> DecompressionResult<usize> {
         unsafe {
             init_allocator();
             let mut out_nbytes = 0;
             let in_ptr = zlib_data.as_ptr() as *const std::ffi::c_void;
             let out_ptr = out.as_mut_ptr() as *mut std::ffi::c_void;
-            let ret: libdeflate_result =
-                libdeflate_zlib_decompress(self.p,
-                                           in_ptr,
-                                           zlib_data.len(),
-                                           out_ptr,
-                                           out.len(),
-                                           &mut out_nbytes);
+            let ret: libdeflate_result = libdeflate_zlib_decompress(
+                self.p,
+                in_ptr,
+                zlib_data.len(),
+                out_ptr,
+                out.len(),
+                &mut out_nbytes,
+            );
 
             match ret {
-                libdeflate_result_LIBDEFLATE_SUCCESS => {
-                    Ok(out_nbytes)
-                },
-                libdeflate_result_LIBDEFLATE_BAD_DATA => {
-                    Err(DecompressionError::BadData)
-                },
+                libdeflate_result_LIBDEFLATE_SUCCESS => Ok(out_nbytes),
+                libdeflate_result_LIBDEFLATE_BAD_DATA => Err(DecompressionError::BadData),
                 libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
                     Err(DecompressionError::InsufficientSpace)
-                },
+                }
                 _ => {
                     panic!("libdeflate_zlib_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
                 }
@@ -228,32 +436,31 @@ impl Decompressor {
     /// decompressed bytes written into `out`, or an error (see
     /// [`DecompressionError`](enum.DecompressionError.html) for error
     /// cases).
-    pub fn deflate_decompress(&mut self,
-                              deflate_data: &[u8],
-                              out: &mut [u8]) -> DecompressionResult<usize> {
+    pub fn deflate_decompress(
+        &mut self,
+        deflate_data: &[u8],
+        out: &mut [u8],
+    ) -> DecompressionResult<usize> {
         unsafe {
             init_allocator();
             let mut out_nbytes = 0;
             let in_ptr = deflate_data.as_ptr() as *const std::ffi::c_void;
             let out_ptr = out.as_mut_ptr() as *mut std::ffi::c_void;
-            let ret: libdeflate_result =
-                libdeflate_deflate_decompress(self.p,
-                                              in_ptr,
-                                              deflate_data.len(),
-                                              out_ptr,
-                                              out.len(),
-                                              &mut out_nbytes);
+            let ret: libdeflate_result = libdeflate_deflate_decompress(
+                self.p,
+                in_ptr,
+                deflate_data.len(),
+                out_ptr,
+                out.len(),
+                &mut out_nbytes,
+            );
 
             match ret {
-                libdeflate_result_LIBDEFLATE_SUCCESS => {
-                    Ok(out_nbytes)
-                },
-                libdeflate_result_LIBDEFLATE_BAD_DATA => {
-                    Err(DecompressionError::BadData)
-                },
+                libdeflate_result_LIBDEFLATE_SUCCESS => Ok(out_nbytes),
+                libdeflate_result_LIBDEFLATE_BAD_DATA => Err(DecompressionError::BadData),
                 libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
                     Err(DecompressionError::InsufficientSpace)
-                },
+                }
                 _ => {
                     panic!("libdeflate_deflate_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
                 }
@@ -272,7 +479,7 @@ impl Drop for Decompressor {
 
 /// Raw numeric values of compression levels that are accepted by libdeflate
 const MIN_COMPRESSION_LVL: i32 = 0;
-const DEFAULT_COMPRESSION_LVL : i32 = 6;
+const DEFAULT_COMPRESSION_LVL: i32 = 6;
 const MAX_COMPRESSION_LVL: i32 = 12;
 
 /// Compression level used by a [`Compressor`](struct.Compressor.html)
@@ -396,7 +603,6 @@ pub struct Compressor {
 unsafe impl Send for Compressor {}
 
 impl Compressor {
-
     /// Returns a newly constructed `Compressor` that compresses data
     /// with the supplied
     /// [`CompressionLvl`](struct.CompressionLvl.html)
@@ -405,7 +611,7 @@ impl Compressor {
             init_allocator();
             let ptr = libdeflate_alloc_compressor(lvl.0);
             if !ptr.is_null() {
-                Compressor{ p: ptr }
+                Compressor { p: ptr }
             } else {
                 panic!("libdeflate_alloc_compressor returned NULL: out of memory");
             }
@@ -418,28 +624,30 @@ impl Compressor {
     /// possible compression ratio (i.e. assumes the data cannot be
     /// compressed), format overhead, etc.
     pub fn deflate_compress_bound(&mut self, n_bytes: usize) -> usize {
-        unsafe {
-            libdeflate_deflate_compress_bound(self.p, n_bytes)
-        }
+        unsafe { libdeflate_deflate_compress_bound(self.p, n_bytes) }
     }
 
     /// Compresses `in_raw_data` as
     /// [`deflate`](https://tools.ietf.org/html/rfc1951) data, writing
     /// the data into `out_deflate_data`. Returns the number of bytes
     /// written into `out_deflate_data`.
-    pub fn deflate_compress(&mut self,
-                            in_raw_data: &[u8],
-                            out_deflate_data: &mut [u8]) -> CompressionResult<usize> {
+    pub fn deflate_compress(
+        &mut self,
+        in_raw_data: &[u8],
+        out_deflate_data: &mut [u8],
+    ) -> CompressionResult<usize> {
         unsafe {
             init_allocator();
             let in_ptr = in_raw_data.as_ptr() as *const std::ffi::c_void;
             let out_ptr = out_deflate_data.as_mut_ptr() as *mut std::ffi::c_void;
 
-            let sz = libdeflate_deflate_compress(self.p,
-                                                 in_ptr,
-                                                 in_raw_data.len(),
-                                                 out_ptr,
-                                                 out_deflate_data.len());
+            let sz = libdeflate_deflate_compress(
+                self.p,
+                in_ptr,
+                in_raw_data.len(),
+                out_ptr,
+                out_deflate_data.len(),
+            );
 
             if sz != 0 {
                 Ok(sz)
@@ -455,28 +663,30 @@ impl Compressor {
     /// possible compression ratio (i.e. assumes the data cannot be
     /// compressed), format overhead, etc.
     pub fn zlib_compress_bound(&mut self, n_bytes: usize) -> usize {
-        unsafe {
-            libdeflate_zlib_compress_bound(self.p, n_bytes)
-        }
+        unsafe { libdeflate_zlib_compress_bound(self.p, n_bytes) }
     }
 
     /// Compresses `in_raw_data` as
     /// [`zlib`](https://www.ietf.org/rfc/rfc1950.txt) data, writing
     /// the data into `out_zlib_data`. Returns the number of bytes
     /// written into `out_zlib_data`.
-    pub fn zlib_compress(&mut self,
-                         in_raw_data: &[u8],
-                         out_zlib_data: &mut [u8]) -> CompressionResult<usize> {
+    pub fn zlib_compress(
+        &mut self,
+        in_raw_data: &[u8],
+        out_zlib_data: &mut [u8],
+    ) -> CompressionResult<usize> {
         unsafe {
             init_allocator();
             let in_ptr = in_raw_data.as_ptr() as *const std::ffi::c_void;
             let out_ptr = out_zlib_data.as_mut_ptr() as *mut std::ffi::c_void;
 
-            let sz = libdeflate_zlib_compress(self.p,
-                                              in_ptr,
-                                              in_raw_data.len(),
-                                              out_ptr,
-                                              out_zlib_data.len());
+            let sz = libdeflate_zlib_compress(
+                self.p,
+                in_ptr,
+                in_raw_data.len(),
+                out_ptr,
+                out_zlib_data.len(),
+            );
 
             if sz != 0 {
                 Ok(sz)
@@ -492,28 +702,30 @@ impl Compressor {
     /// possible compression ratio (i.e. assumes the data cannot be
     /// compressed), format overhead, etc.
     pub fn gzip_compress_bound(&mut self, n_bytes: usize) -> usize {
-        unsafe {
-            libdeflate_gzip_compress_bound(self.p, n_bytes)
-        }
+        unsafe { libdeflate_gzip_compress_bound(self.p, n_bytes) }
     }
 
     /// Compresses `in_raw_data` as
     /// [`gzip`](https://tools.ietf.org/html/rfc1952) data, writing
     /// the data into `out_gzip_data`. Returns the number of bytes
     /// written into `out_gzip_data`.
-    pub fn gzip_compress(&mut self,
-                         in_raw_data: &[u8],
-                         out_gzip_data: &mut [u8]) -> CompressionResult<usize> {
+    pub fn gzip_compress(
+        &mut self,
+        in_raw_data: &[u8],
+        out_gzip_data: &mut [u8],
+    ) -> CompressionResult<usize> {
         unsafe {
             init_allocator();
             let in_ptr = in_raw_data.as_ptr() as *const std::ffi::c_void;
             let out_ptr = out_gzip_data.as_mut_ptr() as *mut std::ffi::c_void;
 
-            let sz = libdeflate_gzip_compress(self.p,
-                                              in_ptr,
-                                              in_raw_data.len(),
-                                              out_ptr,
-                                              out_gzip_data.len());
+            let sz = libdeflate_gzip_compress(
+                self.p,
+                in_ptr,
+                in_raw_data.len(),
+                out_ptr,
+                out_gzip_data.len(),
+            );
 
             if sz != 0 {
                 Ok(sz)
@@ -547,9 +759,11 @@ impl Crc {
     /// Update the CRC with the bytes in `data`
     pub fn update(&mut self, data: &[u8]) {
         unsafe {
-            self.val = libdeflate_crc32(self.val,
-                                        data.as_ptr() as *const core::ffi::c_void,
-                                        data.len());
+            self.val = libdeflate_crc32(
+                self.val,
+                data.as_ptr() as *const core::ffi::c_void,
+                data.len(),
+            );
         }
     }
 
@@ -583,12 +797,13 @@ impl Adler32 {
     }
     /// Update the Adler32 with the bytes in `data`
     pub fn update(&mut self, data: &[u8]) {
-        unsafe
-            {
-                self.val = libdeflate_adler32(self.val,
-                                              data.as_ptr() as *const core::ffi::c_void,
-                                              data.len());
-            }
+        unsafe {
+            self.val = libdeflate_adler32(
+                self.val,
+                data.as_ptr() as *const core::ffi::c_void,
+                data.len(),
+            );
+        }
     }
     /// Returns the current Adler32 checksum
     pub fn sum(&self) -> u32 {
@@ -600,8 +815,9 @@ impl Adler32 {
 /// Note: this is a one-shot method that requires all data
 /// up-front. Developers wanting to compute a rolling adler32 from
 /// (e.g.) a stream should use [`Adler32`](struct.Adler32.html)
-pub fn adler32(data:&[u8]) -> u32 {
+pub fn adler32(data: &[u8]) -> u32 {
     let mut adler32 = Adler32::new();
     adler32.update(&data);
     adler32.sum()
 }
+

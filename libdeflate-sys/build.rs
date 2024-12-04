@@ -31,6 +31,8 @@ fn main() {
             "libdeflate/lib/utils.c",
             "libdeflate/lib/zlib_compress.c",
             "libdeflate/lib/zlib_decompress.c",
+            "libdeflate/lib/gdeflate_compress.c",
+            "libdeflate/lib/gdeflate_decompress.c",
         ])
         .include("libdeflate")
         .warnings(false)

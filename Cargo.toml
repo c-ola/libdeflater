@@ -22,6 +22,7 @@ exclude = [
 ]
 
 [dependencies]
+byteorder = "1.5.0"
 libdeflate-sys = { version = "1.22.0", path = "libdeflate-sys" }
 
 [dev-dependencies]
