@@ -474,6 +474,14 @@ impl Drop for Decompressor {
     }
 }
 
+impl Drop for GDeflateDecompressor {
+    fn drop(&mut self) {
+        unsafe {
+            libdeflate_free_gdeflate_decompressor(self.p);
+        }
+    }
+}
+
 /// Raw numeric values of compression levels that are accepted by libdeflate
 const MIN_COMPRESSION_LVL: i32 = 0;
 const DEFAULT_COMPRESSION_LVL: i32 = 6;

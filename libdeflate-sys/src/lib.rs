@@ -52,7 +52,7 @@ extern "C" {
     pub fn libdeflate_alloc_gdeflate_decompressor()-> *mut libdeflate_gdeflate_decompressor;
     
     pub fn libdeflate_free_gdeflate_compressor (compressor : * mut libdeflate_gdeflate_compressor);
-    pub fn libdeflate_free_gdeflate_decompressor (decomp: * mut libdeflate_gdeflate_compressor);
+    pub fn libdeflate_free_gdeflate_decompressor (decomp: * mut libdeflate_gdeflate_decompressor);
 
 
     pub fn libdeflate_zlib_compress_bound(compressor: *mut libdeflate_compressor,
