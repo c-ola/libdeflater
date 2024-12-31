@@ -155,7 +155,8 @@ impl_bit!(u64, a, b, c);
 impl_bit!(u64, a, b, c, d);
 impl_bit!(u64, a, b, c, d, e);
 
-struct TileStream {
+#[derive(Debug)]
+pub struct TileStream {
     id: u8,
     magic: u8,
     num_tiles: u16,      //u16,
@@ -241,6 +242,7 @@ impl GDeflateDecompressor {
             init_allocator();
             let mut in_data = Cursor::new(&in_data_raw);
             let header = TileStream::from(&mut in_data).unwrap();
+            //println!("{header:#?}");
             if !header.is_valid() {
                 return Err(DecompressionError::BadData);
             }
@@ -261,7 +263,6 @@ impl GDeflateDecompressor {
                 } else {
                     *tile_offsets
                 };
-
                 let data_ptr = base_in_ptr.add(tile_offset) as *const std::ffi::c_void;
 
                 let mut compressed_page = libdeflate_gdeflate_in_page {
@@ -270,7 +271,6 @@ impl GDeflateDecompressor {
                 };
 
                 let output_offset = tile_index as usize * KDEFAULT_TILE_SIZE;
-
                 let out_ptr =
                     out_data.as_mut_ptr().add(output_offset) as *mut std::ffi::c_void;
                 let mut out_nbytes = 0;
