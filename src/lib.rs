@@ -76,9 +76,14 @@ use libdeflate_sys::{
     libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE, libdeflate_result_LIBDEFLATE_SUCCESS,
     libdeflate_zlib_compress, libdeflate_zlib_compress_bound, libdeflate_zlib_decompress,
 };
+use core::num;
 use std::fmt::{self, Write};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::ptr::null;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{JoinHandle, Thread};
 use std::{convert::TryInto, error::Error};
 
 #[cfg(feature = "use_rust_alloc")]
@@ -232,7 +237,119 @@ impl GDeflateDecompressor {
     }
 }
 
+const MAX_WORKERS: u32 = 31;
+
 impl GDeflateDecompressor {
+    pub fn gdeflate_decompress_threaded(
+        in_data: &[u8],
+        out_data: &mut [u8],
+        num_workers: u32,
+    ) -> DecompressionResult<usize> {
+        let bytes_read_res = Arc::new(AtomicUsize::new(0));
+        unsafe {
+            init_allocator();
+
+            // Read header 
+            let mut in_data_cursor = Cursor::new(&in_data);
+            let header = TileStream::from(&mut in_data_cursor).unwrap();
+            if !header.is_valid() {
+                return Err(DecompressionError::BadData);
+            }
+
+            let tile_index = Arc::new(AtomicU32::new(0));
+            let failed = Arc::new(AtomicBool::new(false));
+            let result = Arc::new(Mutex::new(Ok(())));
+
+            // Set up worker threads
+            let num_workers = MAX_WORKERS.min(num_workers).max(1);
+            let mut worker_handles: Vec<JoinHandle<()>> = Vec::with_capacity(num_workers as usize);
+
+            let in_ptr = in_data.as_ptr() as usize;
+            let out_ptr = out_data.as_mut_ptr() as *mut u8 as usize;
+            for i in 0..num_workers {
+                let tidx = tile_index.clone();
+                let num_tiles = header.num_tiles as u32;
+                let failed = failed.clone();
+                let result = result.clone();
+                let bytes_read = bytes_read_res.clone();
+
+                worker_handles.push(std::thread::spawn(move || {
+                    let mut worker_bytes_read = 0;
+                    let decompressor = GDeflateDecompressor::new();
+                    let tile_offsets = (in_ptr as *const u8).add(size_of::<u64>()) as *const u32;
+                    let in_data_ptr = tile_offsets.add(num_tiles as usize) as *const u8;
+                    loop {
+                        // get tile info
+                        let tile_index = tidx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if tile_index >= num_tiles || failed.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let tile_offset = if tile_index > 0 {
+                            *tile_offsets.wrapping_add(tile_index as usize)
+                        } else {
+                            0
+                        };
+
+                        // Create the page
+                        let data_size = if tile_index < num_tiles - 1 {
+                            *tile_offsets.wrapping_add(tile_index as usize + 1) - tile_offset as u32
+                        } else {
+                            *tile_offsets
+                        };
+                        let data_ptr = in_data_ptr.add(tile_offset as usize) as *const std::ffi::c_void;
+                        let mut compressed_page = libdeflate_gdeflate_in_page {
+                            data: data_ptr,
+                            nbytes: data_size as usize,
+                        };
+
+                        let output_offset = tile_index as usize * KDEFAULT_TILE_SIZE;
+                        let out_ptr = (out_ptr as *mut u8).wrapping_add(output_offset) as *mut std::ffi::c_void;
+
+                        let mut out_nbytes = 0;
+                        let decomp_result: libdeflate_result = libdeflate_gdeflate_decompress(
+                            decompressor.p,
+                            &mut compressed_page,
+                            1,
+                            out_ptr,
+                            KDEFAULT_TILE_SIZE,
+                            &mut out_nbytes,
+                        ) as libdeflate_result;
+
+                        let mut result = result.lock().unwrap();
+                        match decomp_result {
+                            libdeflate_result_LIBDEFLATE_SUCCESS => worker_bytes_read += out_nbytes,
+                            libdeflate_result_LIBDEFLATE_BAD_DATA => {
+                                *result = Err(DecompressionError::BadData);
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            },
+                            libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE => {
+                                *result = Err(DecompressionError::InsufficientSpace);
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            _ => {
+                                panic!("libdeflate_gdeflate_decompress returned an unknown error type: this is an internal bug that **must** be fixed");
+                            }
+                        }
+                    }
+                    let x = bytes_read.load(Ordering::Relaxed);
+                    bytes_read.store(x + worker_bytes_read, Ordering::Relaxed);
+                }));
+            }
+
+            for worker in worker_handles {
+                worker.join().unwrap();
+            }
+            let res = result.lock().unwrap();
+            match *res {
+                Ok(_) => (),
+                Err(e) => return Err(e),
+            }
+        }
+        let x = bytes_read_res.load(Ordering::Relaxed);
+        Ok(x)
+    }
     pub fn gdeflate_decompress(
         in_data_raw: &[u8],
         out_data: &mut [u8],
@@ -242,7 +359,6 @@ impl GDeflateDecompressor {
             init_allocator();
             let mut in_data = Cursor::new(&in_data_raw);
             let header = TileStream::from(&mut in_data).unwrap();
-            //println!("{header:#?}");
             if !header.is_valid() {
                 return Err(DecompressionError::BadData);
             }
@@ -301,6 +417,69 @@ impl GDeflateDecompressor {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn gdeflate_decompress(
+    out_data: *mut u8,
+    out_size: u64,
+    in_data: *const u8,
+    in_size: u64,
+    num_workers: u32,
+) -> bool {
+    if in_data.is_null() || out_data.is_null() {
+        return false;
+    }
+    let input = unsafe { std::slice::from_raw_parts(in_data, in_size as usize)};
+    let output = unsafe { std::slice::from_raw_parts_mut(out_data, out_size as usize)};
+    if num_workers == 0 {
+        return match GDeflateDecompressor::gdeflate_decompress(input, output) {
+            Ok(_size) => true,
+            Err(_) => false,
+        }
+    }
+    else {
+        return match GDeflateDecompressor::gdeflate_decompress_threaded(input, output, num_workers) {
+            Ok(_size) => true,
+            Err(_) => false,
+        }
+    }
+
+}
+
+#[no_mangle]
+pub extern "C" fn gdeflate_get_uncompressed_size(
+    in_data: *const u8,
+    in_size: u64,
+    uncompressed_size: *mut u64
+) -> bool {
+    if in_data.is_null() {
+        return false;
+    }
+    let input = unsafe { std::slice::from_raw_parts(in_data, in_size as usize)};
+    let mut cursor = Cursor::new(input);
+    let stream = match TileStream::from(&mut cursor) {
+        Ok(x) => x,
+        Err(_e) => return false,
+    };
+    unsafe {
+        *uncompressed_size = stream.get_uncompressed_size() as u64;
+    }
+    true
+
+}
+
+#[no_mangle]
+pub extern "C" fn gdeflate_compress(
+    out_data: *mut u8,
+    out_size: *mut u64,
+    in_data: *const u8,
+    in_size: u64,
+    level: u32,
+    flags: u32,
+) -> bool {
+    return false;
+}
+
+
 /// A `libdeflate` decompressor that can inflate DEFLATE, zlib, or
 /// gzip data.
 pub struct Decompressor {
@@ -311,7 +490,7 @@ unsafe impl Send for Decompressor {}
 /// An error that may be returned by one of the
 /// [`Decompressor`](struct.Decompressor.html)'s `decompress_*`
 /// methods when a decompression cannot be performed.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum DecompressionError {
     /// The provided data is invalid in some way. For example, the
     /// checksum in the data revealed possible corruption, magic

@@ -47,3 +47,8 @@ freestanding = ["libdeflate-sys/freestanding", "use_rust_alloc"]
 dynamic = ["libdeflate-sys/dynamic"]
 
 [workspace]
+
+
+[lib]
+name = "gdeflate"
+crate-type = ["cdylib", "staticlib"]
